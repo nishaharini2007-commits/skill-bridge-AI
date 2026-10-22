@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+*.db
+.env
+.venv/
+venv/
+node_modules/
+dist/
+*.tsbuildinfo
+.pytest_cache/
+.coverage
+
+# Local environment files
+.env.*
+!.env.example
+
+# Python virtual environments
+.python-version
+.python_env/
+pip-wheel-metadata/
+
+# Editor and operating system files
+.DS_Store
+Thumbs.db
