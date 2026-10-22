@@ -45,6 +45,30 @@ Industry postings add four tables: `industry_project_criteria`, `project_applica
 
 Candidate matching is deterministic and advisory. It uses saved student skill levels, completed platform assessments and verified project evidence when present; it does not infer credentials or external profile activity, and a low match does not block applications. Companies control application statuses and final shortlisting decisions.
 
+The additive Industry Portal also stores company contact details, student profile-link sharing consent, project specifications, submission revisions and reviews, vacancy criteria, application status history, and in-app notifications. Its tables are created additively at startup. Student LinkedIn/GitHub links are shown to industry reviewers only when the student enables profile sharing. Historical course completion is not inferred from student-entered course names. An optional `backend/bootstrap_tcs.py` command can provision a TCS Industry account using `TCS_INDUSTRY_EMAIL` and `TCS_INDUSTRY_PASSWORD`; it was not run automatically. Configure the environment variables and verify the intended database before running it. It never prints the password.
+
+The Institution dashboard scopes student records to an exact, case-insensitive match between the saved student `college` and the authenticated institution name; unmatched students are not exposed. Institution course assignment/progress and mentor assignments/history use the additive `institution_course_enrollments`, `institution_mentorships`, and `institution_mentorship_history` tables. Institution mentor rosters and availability use the additive `institution_mentor_memberships` table; existing mentor accounts must be explicitly associated by an institution, and student assignments require an active membership. Mentor review APIs only expose submissions from students assigned through an active institution membership. Public self-registration for the mentor role is disabled, while existing mentor accounts continue to authenticate through the standard sign-in form. Institution-managed mentor account creation uses the existing user/mentor tables and password hashing; the app has no email invitation service, so no invitation is sent. Existing course catalog, assessment, role requirement, learning roadmap, project, and application records are read in place. Course progress is not backfilled from student-entered course names because those do not contain verifiable enrollment/completion records. Student login, authentication, and role routing remain unchanged.
+
+### Multi-company recruitment demo data
+
+To seed only the six demo company directory profiles (without creating Industry accounts, vacancies, or applications), run from `backend`:
+
+```powershell
+python -m app.seed_demo_company_directory
+```
+
+This command adds missing rows to `industry_demo_company_directory` only, is safe to rerun, and does not run automatically at startup. The Industry-only directory page reads these persisted rows from `GET /api/industry/demo-companies`.
+
+The separate `app.seed_demo_industry` command adds demo-only recruiter accounts and simulated sample vacancies for Tata Consultancy Services, Amazon, Infosys, Microsoft, Wipro, and Accenture. These accounts and postings are labeled as demo data; they do not claim company registration, partnership, endorsement, or real/live openings. No synthetic student accounts or application outcomes are seeded. Existing student accounts can apply through the normal authenticated application flow.
+
+Seeding is explicit and repeatable; it is never run at application startup. It creates only missing demo records in additive tables and does not update existing accounts or vacancies. Configure a distinct email and a 12–128 character password for each demo recruiter using `SKILLBRIDGE_DEMO_<COMPANY>_EMAIL` and `SKILLBRIDGE_DEMO_<COMPANY>_PASSWORD` (company keys: `TCS`, `AMAZON`, `INFOSYS`, `MICROSOFT`, `WIPRO`, `ACCENTURE`), then run from `backend`:
+
+```powershell
+python -m app.seed_demo_industry
+```
+
+The command reports only how many records it added; it does not print configured credentials. If the configured email belongs to an existing account, the seeder stops rather than modifying or taking over that account. Do not use the destructive `python seed.py` command to seed recruitment examples; that script resets its demo database.
+
 ## Windows setup
 
 Prerequisites: Python 3.11+ and Node.js 20+.
@@ -105,6 +129,12 @@ Running `python seed.py` resets the local demo database to its original state.
 - `GET|POST /api/industry/job-vacancies`, `PATCH /api/industry/job-vacancies/{id}`, `PATCH /api/industry/job-vacancies/{id}/status`
 - `GET /api/student/job-vacancies`, `POST /api/student/job-vacancies/{id}/applications`
 - `GET /api/industry/job-vacancies/{id}/applications`, `PATCH /api/industry/job-applications/{id}`
+- `GET|PUT /api/industry/company-profile`, `GET|PUT /api/student/profile-sharing`
+- `GET|POST|PUT /api/industry/portal/projects`, `PATCH /api/industry/portal/projects/{id}/status`
+- `GET|POST|PUT /api/industry/portal/job-vacancies`, `PATCH /api/industry/portal/job-vacancies/{id}/status`
+- `POST /api/projects/{id}/submission`, `GET /api/industry/project-submissions`, `POST /api/industry/project-submissions/{id}/reviews`, `GET /api/student/project-submissions`
+- `GET /api/industry/job-applications/analysis`, `PUT /api/industry/job-vacancies/{id}/requirements`, `POST /api/industry/job-applications/{id}/status`
+- `GET /api/student/application-status-history`, `GET /api/student/notifications`, `GET /api/industry/notifications`, `PATCH /api/notifications/{id}/read`
 - `GET /api/student/passport`, `/api/student/progress`, `/api/opportunities/matches`
 - `POST /api/industry/skills/extract`, `POST /api/industry/requirements`, `GET /api/industry/dashboard`, `/api/industry/talent`
 - `GET /api/institution/analytics`, `GET /api/mentor/dashboard`, `GET /api/health`

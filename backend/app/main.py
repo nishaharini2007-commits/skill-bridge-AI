@@ -1,13 +1,15 @@
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import secrets
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Annotated, Literal
 from urllib.parse import urlparse
+from uuid import uuid4
 
 import jwt
 from fastapi import Depends, FastAPI, HTTPException, status
@@ -15,7 +17,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, EmailStr, Field, field_validator
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, func, select
+from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, mapped_column, relationship
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -31,6 +34,8 @@ from .services.learning_plan import (
     skill_guidance,
     valid_resource_url,
 )
+
+logger = logging.getLogger(__name__)
 
 SECRET_KEY = os.getenv("SECRET_KEY", "local-demo-secret-change-before-deployment")
 ALGORITHM = "HS256"
@@ -148,6 +153,65 @@ class Institution(Base):
     user = relationship("User", back_populates="institution")
 
 
+class InstitutionCourseEnrollment(Base):
+    __tablename__ = "institution_course_enrollments"
+    id = mapped_column(Integer, primary_key=True)
+    institution_id = mapped_column(ForeignKey("institutions.id"), nullable=False, index=True)
+    student_id = mapped_column(ForeignKey("students.id"), nullable=False, index=True)
+    course_id = mapped_column(ForeignKey("courses.id"), nullable=False)
+    status = mapped_column(String(20), default="PENDING", nullable=False)
+    assigned_at = mapped_column(DateTime, default=utc_now, nullable=False)
+    completed_at = mapped_column(DateTime)
+    score = mapped_column(Float)
+    student = relationship("Student")
+    course = relationship("Course")
+    __table_args__ = (UniqueConstraint("institution_id", "student_id", "course_id"),)
+
+
+class InstitutionMentorship(Base):
+    __tablename__ = "institution_mentorships"
+    id = mapped_column(Integer, primary_key=True)
+    institution_id = mapped_column(ForeignKey("institutions.id"), nullable=False, index=True)
+    student_id = mapped_column(ForeignKey("students.id"), nullable=False, unique=True)
+    mentor_id = mapped_column(ForeignKey("mentors.id"))
+    status = mapped_column(String(20), default="NOT_ASSIGNED", nullable=False)
+    reason = mapped_column(Text, default="", nullable=False)
+    notes = mapped_column(Text, default="", nullable=False)
+    follow_up_date = mapped_column(Date)
+    created_at = mapped_column(DateTime, default=utc_now, nullable=False)
+    updated_at = mapped_column(DateTime, default=utc_now, onupdate=utc_now, nullable=False)
+    mentor = relationship("Mentor")
+
+
+class InstitutionMentorshipHistory(Base):
+    __tablename__ = "institution_mentorship_history"
+    id = mapped_column(Integer, primary_key=True)
+    institution_id = mapped_column(ForeignKey("institutions.id"), nullable=False, index=True)
+    student_id = mapped_column(ForeignKey("students.id"), nullable=False, index=True)
+    mentor_id = mapped_column(ForeignKey("mentors.id"))
+    status = mapped_column(String(20), nullable=False)
+    reason = mapped_column(Text, default="", nullable=False)
+    notes = mapped_column(Text, default="", nullable=False)
+    follow_up_date = mapped_column(Date)
+    created_at = mapped_column(DateTime, default=utc_now, nullable=False)
+    mentor = relationship("Mentor")
+
+
+class InstitutionMentorMembership(Base):
+    __tablename__ = "institution_mentor_memberships"
+    id = mapped_column(Integer, primary_key=True)
+    institution_id = mapped_column(ForeignKey("institutions.id"), nullable=False, index=True)
+    mentor_id = mapped_column(ForeignKey("mentors.id"), nullable=False, index=True)
+    expertise = mapped_column(String(255), default="", nullable=False)
+    experience = mapped_column(Integer, default=0, nullable=False)
+    active = mapped_column(Boolean, default=True, nullable=False)
+    availability = mapped_column(String(40), default="AVAILABLE", nullable=False)
+    created_at = mapped_column(DateTime, default=utc_now, nullable=False)
+    updated_at = mapped_column(DateTime, default=utc_now, onupdate=utc_now, nullable=False)
+    mentor = relationship("Mentor")
+    __table_args__ = (UniqueConstraint("institution_id", "mentor_id"),)
+
+
 class Mentor(Base):
     __tablename__ = "mentors"
     id = mapped_column(Integer, primary_key=True)
@@ -232,6 +296,7 @@ class AssessmentResult(Base):
     score = mapped_column(Float, default=0)
     proficiency = mapped_column(Integer, default=1)
     assessment = relationship("Assessment", back_populates="results")
+    skill = relationship("Skill")
 
 
 class Roadmap(Base):
@@ -375,7 +440,7 @@ class Credentials(BaseModel):
 
 class RegisterInput(Credentials):
     name: str = Field(min_length=2, max_length=120)
-    role: str = Field(pattern="^(student|industry|mentor|institution)$")
+    role: str = Field(pattern="^(student|industry|institution)$")
 
 
 class ProfileInput(BaseModel):
@@ -411,10 +476,35 @@ class LearningProfileInput(BaseModel):
     def validate_profile_url(cls, value: str | None):
         if value is None or not value.strip():
             return ""
-        parsed = urlparse(value.strip())
-        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        normalized = value.strip()
+        parsed = urlparse(normalized)
+        if parsed.scheme.lower() not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password:
             raise ValueError("Profile URLs must be valid http or https URLs")
-        return value.strip()
+        return normalized
+
+    @field_validator("github_url")
+    @classmethod
+    def validate_github_profile_url(cls, value: str | None):
+        host = urlparse(value).hostname if value else None
+        if host and not (host == "github.com" or host.endswith(".github.com")):
+            raise ValueError("GitHub profile URLs must use github.com or its subdomains")
+        return value
+
+    @field_validator("linkedin_url")
+    @classmethod
+    def validate_linkedin_profile_url(cls, value: str | None):
+        host = urlparse(value).hostname if value else None
+        if host and not (host == "linkedin.com" or host.endswith(".linkedin.com")):
+            raise ValueError("LinkedIn profile URLs must use linkedin.com or its subdomains")
+        return value
+
+    @field_validator("leetcode_url")
+    @classmethod
+    def validate_leetcode_profile_url(cls, value: str | None):
+        host = urlparse(value).hostname if value else None
+        if host and not (host == "leetcode.com" or host.endswith(".leetcode.com")):
+            raise ValueError("LeetCode profile URLs must use leetcode.com or its subdomains")
+        return value
 
     @field_validator("programming_languages", "completed_courses", "completed_projects", "target_companies")
     @classmethod
@@ -428,6 +518,43 @@ class LearningProfileInput(BaseModel):
 
 class LearningTaskStatusInput(BaseModel):
     status: Literal["Not Started", "In Progress", "Completed"]
+
+
+class InstitutionCourseEnrollmentInput(BaseModel):
+    course_id: int = Field(ge=1)
+
+
+class InstitutionCourseStatusInput(BaseModel):
+    status: Literal["PENDING", "IN_PROGRESS", "COMPLETED"]
+    score: float | None = Field(default=None, ge=0, le=100)
+
+
+class InstitutionMentorshipInput(BaseModel):
+    mentor_id: int | None = Field(default=None, ge=1)
+    status: Literal["NOT_ASSIGNED", "ASSIGNED", "IN_PROGRESS", "COMPLETED"]
+    reason: str = Field(default="", max_length=1000)
+    notes: str = Field(default="", max_length=5000)
+    follow_up_date: date | None = None
+
+
+class InstitutionMentorInput(BaseModel):
+    name: str = Field(min_length=2, max_length=120)
+    email: EmailStr
+    expertise: str = Field(min_length=2, max_length=255)
+    experience: int = Field(ge=0, le=60)
+    password: str = Field(min_length=12, max_length=128)
+    availability: Literal["AVAILABLE", "LIMITED", "UNAVAILABLE"] = "AVAILABLE"
+
+
+class InstitutionMentorAssociationInput(BaseModel):
+    email: EmailStr
+
+
+class InstitutionMentorUpdateInput(BaseModel):
+    expertise: str = Field(min_length=2, max_length=255)
+    experience: int = Field(ge=0, le=60)
+    availability: Literal["AVAILABLE", "LIMITED", "UNAVAILABLE"]
+    active: bool
 
 
 class CareerInput(BaseModel):
@@ -488,7 +615,16 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(title="SkillBridge AI API", version="1.0.0", description="Industry-academia skill intelligence platform", lifespan=lifespan)
 origins = os.getenv("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",")
-app.add_middleware(CORSMiddleware, allow_origins=[origin.strip() for origin in origins], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=[origin.strip() for origin in origins], allow_credentials=True, allow_methods=["*"], allow_headers=["*"], expose_headers=["X-Request-ID"])
+
+
+@app.middleware("http")
+async def add_request_id(request: Request, call_next):
+    request_id = uuid4().hex
+    request.state.request_id = request_id
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    return response
 
 
 @app.exception_handler(HTTPException)
@@ -547,8 +683,16 @@ def current_user(credentials: Annotated[HTTPAuthorizationCredentials | None, Dep
 
 
 def require_role(*roles):
-    def check(user: Annotated[User, Depends(current_user)]):
+    def check(request: Request, user: Annotated[User, Depends(current_user)]):
         if user.role not in roles:
+            logger.warning(
+                "Authorization denied: request_id=%s method=%s path=%s actual_role=%s expected_roles=%s",
+                request.state.request_id,
+                request.method,
+                request.url.path,
+                user.role,
+                ",".join(roles),
+            )
             fail("You do not have permission to access this resource", status.HTTP_403_FORBIDDEN)
         return user
     return check
@@ -799,8 +943,6 @@ def register(payload: RegisterInput, db: Annotated[Session, Depends(get_db)]):
         db.add(Student(user_id=user.id))
     elif payload.role == "industry":
         db.add(Industry(user_id=user.id, company_name=payload.name))
-    elif payload.role == "mentor":
-        db.add(Mentor(user_id=user.id))
     else:
         db.add(Institution(user_id=user.id, institution_name=payload.name))
     db.commit()
@@ -1216,7 +1358,9 @@ def project_detail(project_id: int, user: Annotated[User, Depends(current_user)]
     if project is None:
         fail("Project not found", 404)
     student = db.scalar(select(Student).where(Student.user_id == user.id)) if user.role == "student" else None
-    return ok(project_payload(project, student))
+    from .industry_features import _project_payload
+
+    return ok(_project_payload(db, project, student))
 
 
 @app.post("/api/projects", status_code=201)
@@ -1264,8 +1408,36 @@ def submit_project(project_id: int, payload: SubmissionInput, user: Annotated[Us
 
 @app.get("/api/mentor/submissions")
 def mentor_submissions(user: Annotated[User, Depends(require_role("mentor"))], db: Annotated[Session, Depends(get_db)]):
-    submissions = db.scalars(select(ProjectSubmission).order_by(ProjectSubmission.submitted_at.desc())).all()
+    mentor = db.scalar(select(Mentor).where(Mentor.user_id == user.id))
+    student_ids = mentor_accessible_student_ids(db, mentor) if mentor else set()
+    submissions = db.scalars(
+        select(ProjectSubmission)
+        .join(ProjectApplication)
+        .where(ProjectApplication.student_id.in_(student_ids))
+        .order_by(ProjectSubmission.submitted_at.desc())
+    ).all() if student_ids else []
     return ok([{"id": item.id, "project_id": item.application.project_id, "project": item.application.project.title, "student": item.application.student.user.name, "student_id": item.application.student_id, "description": item.description, "github_url": item.github_url, "evidence": item.evidence, "submitted_at": item.submitted_at.isoformat(), "evaluated": item.evaluation is not None, "feedback": item.evaluation.feedback if item.evaluation else ""} for item in submissions])
+
+
+@app.get("/api/student/mentor")
+def student_assigned_mentor(user: Annotated[User, Depends(require_role("student"))], db: Annotated[Session, Depends(get_db)]):
+    student = student_for(db, user)
+    mentorship = db.scalar(select(InstitutionMentorship).where(
+        InstitutionMentorship.student_id == student.id,
+        InstitutionMentorship.status.in_(("ASSIGNED", "IN_PROGRESS")),
+    ))
+    if mentorship is None or mentorship.mentor is None:
+        return ok(None)
+    membership = institution_mentor_membership_for(
+        db, db.get(Institution, mentorship.institution_id), mentorship.mentor_id
+    )
+    if membership is None:
+        return ok(None)
+    return ok({
+        "name": mentorship.mentor.user.name,
+        "expertise": mentorship.mentor.expertise,
+        "status": mentorship.status,
+    })
 
 
 @app.post("/api/projects/submissions/{submission_id}/evaluate")
@@ -1274,6 +1446,8 @@ def evaluate_submission(submission_id: int, payload: EvaluationInput, user: Anno
     submission = db.get(ProjectSubmission, submission_id)
     if mentor is None or submission is None:
         fail("Submission or mentor profile not found", 404)
+    if submission.application.student_id not in mentor_accessible_student_ids(db, mentor):
+        fail("This student is not assigned to you through an active institution", status.HTTP_403_FORBIDDEN)
     if submission.evaluation:
         fail("This submission has already been evaluated", 409)
     scores = [payload.technical_quality, payload.problem_solving, payload.code_quality, payload.communication, payload.innovation]
@@ -1320,6 +1494,24 @@ def student_dashboard(user: Annotated[User, Depends(require_role("student"))], d
     applications = db.scalars(select(ProjectApplication).where(ProjectApplication.student_id == student.id)).all()
     completed_assessments = db.query(Assessment).filter(Assessment.student_id == student.id, Assessment.completed_at.is_not(None)).count()
     return ok({"name": user.name, "career_goal": student.career_goal, "readiness": readiness(db, student), "verified_skills": sum(item.verification_status == "VERIFIED" for item in student.skills), "skill_count": len(student.skills), "open_tasks": sum(not task["completed"] for task in tasks), "roadmap_progress": round(sum(task["completed"] for task in tasks) / len(tasks) * 100) if tasks else 0, "project_applications": len(applications), "opportunity_matches": len(matches), "assessment_count": completed_assessments, "top_gaps": gaps[:4]})
+
+
+@app.get("/api/student/institution-courses")
+def student_institution_courses(user: Annotated[User, Depends(require_role("student"))], db: Annotated[Session, Depends(get_db)]):
+    student = student_for(db, user)
+    records = db.scalars(
+        select(InstitutionCourseEnrollment)
+        .where(InstitutionCourseEnrollment.student_id == student.id)
+        .order_by(InstitutionCourseEnrollment.assigned_at.desc())
+    ).all()
+    return ok([{
+        "course_name": item.course.title,
+        "skill": item.course.skill.name,
+        "status": item.status,
+        "assigned_at": item.assigned_at.isoformat(),
+        "completed_at": item.completed_at.isoformat() if item.completed_at else None,
+        "score": item.score,
+    } for item in records])
 
 
 @app.get("/api/student/progress")
@@ -1422,28 +1614,634 @@ def industry_talent(user: Annotated[User, Depends(require_role("industry"))], db
     return ok([{"name": student.user.name, "college": student.college, "career_goal": student.career_goal, "readiness": readiness(db, student), "skills": [item.skill.name for item in student.skills]} for student in students])
 
 
-@app.get("/api/institution/analytics")
-def institution_analytics(user: Annotated[User, Depends(require_role("institution"))], db: Annotated[Session, Depends(get_db)]):
-    students = db.scalars(select(Student)).all()
+def institution_for(db: Session, user: User) -> Institution:
+    institution = db.scalar(select(Institution).where(Institution.user_id == user.id))
+    if institution is None:
+        fail("Institution profile not found", status.HTTP_404_NOT_FOUND)
+    return institution
+
+
+def institution_students(db: Session, institution: Institution) -> list[Student]:
+    return db.scalars(
+        select(Student)
+        .where(func.lower(func.trim(Student.college)) == institution.institution_name.strip().lower())
+        .order_by(Student.department, Student.year, Student.id)
+    ).all()
+
+
+def institution_mentor_memberships(db: Session, institution: Institution, active_only: bool = False) -> list[InstitutionMentorMembership]:
+    query = select(InstitutionMentorMembership).where(
+        InstitutionMentorMembership.institution_id == institution.id
+    )
+    if active_only:
+        query = query.where(InstitutionMentorMembership.active.is_(True))
+    return db.scalars(query.join(Mentor).join(User).order_by(User.name)).all()
+
+
+def institution_mentor_payload(db: Session, institution: Institution, membership: InstitutionMentorMembership) -> dict:
+    assignments = db.scalars(select(InstitutionMentorship).where(
+        InstitutionMentorship.institution_id == institution.id,
+        InstitutionMentorship.mentor_id == membership.mentor_id,
+        InstitutionMentorship.status != "COMPLETED",
+    )).all()
+    eligible_students = {student.id: student for student in institution_students(db, institution)}
+    assigned_students = []
+    for assignment in assignments:
+        student = eligible_students.get(assignment.student_id)
+        if student is not None:
+            assigned_students.append({
+                "id": student.id,
+                "name": student.user.name,
+                "career_goal": student.career_goal,
+                "department": student.department,
+                "year": student.year,
+                "status": assignment.status,
+            })
+    mentor = membership.mentor
+    return {
+        "id": membership.id,
+        "mentor_id": mentor.id,
+        "name": mentor.user.name,
+        "email": mentor.user.email,
+        "expertise": membership.expertise or mentor.expertise,
+        "skills": [skill.strip() for skill in (membership.expertise or mentor.expertise).split(",") if skill.strip()],
+        "experience": membership.experience if membership.expertise else mentor.experience,
+        "company": mentor.company,
+        "availability": membership.availability,
+        "active": membership.active,
+        "assigned_student_count": len(assigned_students),
+        "assigned_students": assigned_students,
+    }
+
+
+def institution_mentor_membership_for(db: Session, institution: Institution, mentor_id: int, active_only: bool = True):
+    query = select(InstitutionMentorMembership).where(
+        InstitutionMentorMembership.institution_id == institution.id,
+        InstitutionMentorMembership.mentor_id == mentor_id,
+    )
+    if active_only:
+        query = query.where(InstitutionMentorMembership.active.is_(True))
+    return db.scalar(query)
+
+
+def mentor_accessible_student_ids(db: Session, mentor: Mentor) -> set[int]:
+    memberships = db.scalars(
+        select(InstitutionMentorMembership).where(
+            InstitutionMentorMembership.mentor_id == mentor.id,
+            InstitutionMentorMembership.active.is_(True),
+        )
+    ).all()
+    student_ids: set[int] = set()
+    for membership in memberships:
+        institution = db.get(Institution, membership.institution_id)
+        if institution is None:
+            continue
+        for assignment in db.scalars(select(InstitutionMentorship.student_id).where(
+            InstitutionMentorship.institution_id == institution.id,
+            InstitutionMentorship.mentor_id == mentor.id,
+            InstitutionMentorship.status.in_(("ASSIGNED", "IN_PROGRESS")),
+        )).all():
+            student = db.get(Student, assignment)
+            if student is not None and student.college.strip().lower() == institution.institution_name.strip().lower():
+                student_ids.add(student.id)
+    return student_ids
+
+
+def institution_student_summary(db: Session, institution: Institution, student: Student) -> dict:
+    from .industry_features import JobApplication
+
+    enrollments = db.scalars(
+        select(InstitutionCourseEnrollment).where(
+            InstitutionCourseEnrollment.institution_id == institution.id,
+            InstitutionCourseEnrollment.student_id == student.id,
+        )
+    ).all()
+    completed = sum(item.status == "COMPLETED" for item in enrollments)
+    in_progress = sum(item.status == "IN_PROGRESS" for item in enrollments)
+    pending = sum(item.status == "PENDING" for item in enrollments)
+    role = db.scalar(select(CareerRole).where(CareerRole.name == student.career_goal)) if student.career_goal else None
+    results = db.scalars(
+        select(AssessmentResult)
+        .join(Assessment)
+        .where(Assessment.student_id == student.id, Assessment.completed_at.is_not(None))
+        .order_by(Assessment.completed_at.desc(), Assessment.id.desc())
+    ).all()
+    assessed = {}
+    for result in results:
+        assessed.setdefault(result.skill_id, {
+            "skill_id": result.skill_id,
+            "skill": result.skill.name,
+            "proficiency": result.proficiency,
+            "score": result.score,
+            "assessed_at": result.assessment.completed_at.isoformat(),
+        })
+    gaps = []
+    if role is not None:
+        for requirement in role.role_skills:
+            current = assessed.get(requirement.skill_id)
+            gaps.append({
+                "skill": requirement.skill.name,
+                "required": requirement.required_level,
+                "current": current["proficiency"] if current else None,
+                "status": "INSUFFICIENT_EVIDENCE" if current is None else (
+                    "MEETS_REQUIREMENT" if current["proficiency"] >= requirement.required_level else "NEEDS_IMPROVEMENT"
+                ),
+                "recommended_courses": [
+                    {"id": course.id, "title": course.title}
+                    for course in db.scalars(
+                        select(Course).where(Course.skill_id == requirement.skill_id).order_by(Course.id).limit(3)
+                    ).all()
+                ],
+            })
+    completed_assessments = db.scalar(
+        select(func.count(Assessment.id)).where(
+            Assessment.student_id == student.id, Assessment.completed_at.is_not(None)
+        )
+    ) or 0
+    last_assessment = db.scalar(
+        select(Assessment.completed_at)
+        .where(Assessment.student_id == student.id, Assessment.completed_at.is_not(None))
+        .order_by(Assessment.completed_at.desc(), Assessment.id.desc())
+        .limit(1)
+    )
+    assessed_gaps = [item for item in gaps if item["status"] == "NEEDS_IMPROVEMENT"]
+    missing_evidence = [item for item in gaps if item["status"] == "INSUFFICIENT_EVIDENCE"]
+    if not completed_assessments or (role is not None and missing_evidence):
+        gap_status = "ASSESSMENT_PENDING"
+    elif any(item["required"] - item["current"] >= 2 for item in assessed_gaps):
+        gap_status = "SIGNIFICANT_GAPS"
+    elif assessed_gaps:
+        gap_status = "MINOR_GAPS"
+    elif role is not None:
+        gap_status = "SKILLS_ALIGNED"
+    else:
+        gap_status = "ASSESSMENT_PENDING"
+    mentorship = db.scalar(
+        select(InstitutionMentorship).where(
+            InstitutionMentorship.institution_id == institution.id,
+            InstitutionMentorship.student_id == student.id,
+        )
+    )
+    needs_mentorship = (mentorship is None or mentorship.status != "COMPLETED") and (gap_status == "SIGNIFICANT_GAPS" or any(
+        item.status != "COMPLETED" for item in enrollments
+    ))
+    if gap_status == "SIGNIFICANT_GAPS":
+        mentorship_reason = "Significant assessed skill gaps (proficiency gap of at least 2 levels on a 1–5 scale)."
+    elif any(item.status != "COMPLETED" for item in enrollments):
+        mentorship_reason = "Assigned course work is incomplete."
+    else:
+        mentorship_reason = ""
+    profile = db.scalar(select(LearningProfile).where(LearningProfile.student_id == student.id))
+    return {
+        "id": student.id,
+        "name": student.user.name,
+        "email": student.user.email,
+        "department": student.department,
+        "year": student.year,
+        "career_goal": student.career_goal,
+        "assigned_courses": len(enrollments),
+        "assigned_course_ids": [item.course_id for item in enrollments],
+        "completed_courses": completed,
+        "courses_in_progress": in_progress,
+        "pending_courses": pending,
+        "course_completion_percent": round(completed * 100 / len(enrollments), 1) if enrollments else None,
+        "course_data_available": bool(enrollments),
+        "assessed_skills": list(assessed.values()),
+        "skill_gaps": gaps,
+        "skill_gap_status": gap_status,
+        "last_assessment_at": last_assessment.isoformat() if last_assessment else None,
+        "linkedin_url": profile.linkedin_url if profile else "",
+        "github_url": profile.github_url if profile else "",
+        "mentorship_status": mentorship.status if mentorship else "NOT_ASSIGNED",
+        "mentor_id": mentorship.mentor_id if mentorship else None,
+        "mentor_name": mentorship.mentor.user.name if mentorship and mentorship.mentor else None,
+        "mentorship_reason": (mentorship.reason or mentorship_reason) if mentorship else mentorship_reason,
+        "needs_mentorship": needs_mentorship,
+        "mentorship_notes": mentorship.notes if mentorship else "",
+        "follow_up_date": mentorship.follow_up_date.isoformat() if mentorship and mentorship.follow_up_date else None,
+    }
+
+
+def institution_dashboard_payload(db: Session, institution: Institution) -> dict:
+    students = institution_students(db, institution)
+    summaries = [institution_student_summary(db, institution, student) for student in students]
+    total = len(summaries)
+    gap_counts = {}
+    industry_demand = {}
     readiness_scores = [readiness(db, student) for student in students]
-    demand = {}
-    for role_skill in db.scalars(select(RoleSkill)).all():
-        demand[role_skill.skill.name] = demand.get(role_skill.skill.name, 0) + role_skill.required_level
-    skill_gaps = {}
-    for student in students:
-        for gap in gap_items(db, student):
-            if gap["gap"] > 0:
-                skill_gaps[gap["skill"]] = skill_gaps.get(gap["skill"], 0) + 1
-    applications = db.scalars(select(ProjectApplication)).all()
-    return ok({"total_students": len(students), "assessment_completion": round(sum(db.query(Assessment).filter(Assessment.student_id == s.id, Assessment.completed_at.is_not(None)).count() > 0 for s in students) / len(students) * 100) if students else 0, "average_readiness": round(sum(readiness_scores) / len(readiness_scores)) if readiness_scores else 0, "top_skill_gaps": [{"skill": k, "students": v} for k, v in sorted(skill_gaps.items(), key=lambda pair: pair[1], reverse=True)[:8]], "industry_demand": [{"skill": k, "demand": v} for k, v in sorted(demand.items(), key=lambda pair: pair[1], reverse=True)[:8]], "project_participation": len(applications), "verified_skills": sum(item.verification_status == "VERIFIED" for student in students for item in student.skills), "readiness_distribution": [{"student": student.user.name, "readiness": readiness(db, student)} for student in students]})
+    for student, summary in zip(students, summaries):
+        role = db.scalar(select(CareerRole).where(CareerRole.name == student.career_goal)) if student.career_goal else None
+        if role is not None:
+            for requirement in role.role_skills:
+                industry_demand[requirement.skill.name] = industry_demand.get(requirement.skill.name, 0) + requirement.required_level
+        for gap in summary["skill_gaps"]:
+            if gap["status"] == "NEEDS_IMPROVEMENT":
+                gap_counts[gap["skill"]] = gap_counts.get(gap["skill"], 0) + 1
+    enrollments = db.scalars(
+        select(InstitutionCourseEnrollment).where(InstitutionCourseEnrollment.institution_id == institution.id)
+    ).all()
+    student_ids = [student.id for student in students]
+    project_participation = db.scalar(
+        select(func.count(ProjectApplication.id)).where(ProjectApplication.student_id.in_(student_ids))
+    ) if student_ids else 0
+    assessment_completion = sum(bool(db.scalar(
+        select(Assessment.id).where(
+            Assessment.student_id == student.id, Assessment.completed_at.is_not(None)
+        ).limit(1)
+    )) for student in students)
+    department_totals = {}
+    for summary in summaries:
+        department = summary["department"] or "Not specified"
+        aggregate = department_totals.setdefault(department, {"department": department, "students": 0, "assigned": 0, "completed": 0})
+        aggregate["students"] += 1
+        aggregate["assigned"] += summary["assigned_courses"]
+        aggregate["completed"] += summary["completed_courses"]
+    assessment_history = {}
+    if student_ids:
+        for assessment in db.scalars(select(Assessment).where(
+            Assessment.student_id.in_(student_ids), Assessment.completed_at.is_not(None)
+        ).order_by(Assessment.completed_at)).all():
+            month = assessment.completed_at.strftime("%Y-%m")
+            aggregate = assessment_history.setdefault(month, {"month": month, "assessments": 0, "score_total": 0.0})
+            aggregate["assessments"] += 1
+            aggregate["score_total"] += assessment.score or 0
+    return {
+        "institution_name": institution.institution_name,
+        "total_students": total,
+        "students_completed_all_courses": sum(item["assigned_courses"] > 0 and item["completed_courses"] == item["assigned_courses"] for item in summaries),
+        "students_learning": sum(item["courses_in_progress"] > 0 for item in summaries),
+        "students_with_pending_courses": sum(item["pending_courses"] > 0 for item in summaries),
+        "students_with_skill_gaps": sum(item["skill_gap_status"] in {"SIGNIFICANT_GAPS", "MINOR_GAPS"} for item in summaries),
+        "students_requiring_mentorship": sum(item["needs_mentorship"] for item in summaries),
+        "course_catalog": [
+            {"id": course.id, "title": course.title, "skill": course.skill.name}
+            for course in db.scalars(select(Course).order_by(Course.title)).all()
+        ],
+        "mentors": [
+            {"id": membership.mentor.id, "name": membership.mentor.user.name, "expertise": membership.mentor.expertise}
+            for membership in institution_mentor_memberships(db, institution, active_only=True)
+        ],
+        "course_status_counts": {
+            "completed": sum(item.status == "COMPLETED" for item in enrollments),
+            "in_progress": sum(item.status == "IN_PROGRESS" for item in enrollments),
+            "pending": sum(item.status == "PENDING" for item in enrollments),
+        },
+        "department_progress": [{
+            **aggregate,
+            "completion_percent": round(aggregate["completed"] * 100 / aggregate["assigned"], 1) if aggregate["assigned"] else None,
+        } for aggregate in sorted(department_totals.values(), key=lambda item: item["department"].lower())],
+        "assessment_progress_over_time": [{
+            "month": aggregate["month"],
+            "assessments": aggregate["assessments"],
+            "average_score": round(aggregate["score_total"] / aggregate["assessments"], 1),
+        } for aggregate in assessment_history.values()],
+        "common_skill_gaps": [
+            {"skill": skill, "students": count}
+            for skill, count in sorted(gap_counts.items(), key=lambda item: (-item[1], item[0]))[:8]
+        ],
+        "average_readiness": round(sum(readiness_scores) / total) if total else 0,
+        "assessment_completion": round(assessment_completion * 100 / total) if total else 0,
+        "top_skill_gaps": [
+            {"skill": skill, "students": count}
+            for skill, count in sorted(gap_counts.items(), key=lambda item: (-item[1], item[0]))[:8]
+        ],
+        "industry_demand": [
+            {"skill": skill, "demand": count}
+            for skill, count in sorted(industry_demand.items(), key=lambda item: (-item[1], item[0]))[:8]
+        ],
+        "project_participation": project_participation or 0,
+        "verified_skills": sum(item.verification_status == "VERIFIED" for student in students for item in student.skills),
+        "readiness_distribution": [
+            {"student": student.user.name, "readiness": readiness(db, student)}
+            for student in students
+        ],
+        "students": summaries,
+    }
+
+
+@app.get("/api/institution/analytics")
+@app.get("/api/institution/dashboard")
+def institution_analytics(user: Annotated[User, Depends(require_role("institution"))], db: Annotated[Session, Depends(get_db)]):
+    institution = institution_for(db, user)
+    return ok(institution_dashboard_payload(db, institution))
+
+
+@app.get("/api/institution/students/{student_id}")
+def institution_student_detail(student_id: int, user: Annotated[User, Depends(require_role("institution"))], db: Annotated[Session, Depends(get_db)]):
+    institution = institution_for(db, user)
+    student = db.get(Student, student_id)
+    if student is None or student not in institution_students(db, institution):
+        fail("Student not found in this institution", status.HTTP_404_NOT_FOUND)
+    from .industry_features import JobApplication, JobVacancy
+
+    summary = institution_student_summary(db, institution, student)
+    enrollments = db.scalars(
+        select(InstitutionCourseEnrollment)
+        .where(
+            InstitutionCourseEnrollment.institution_id == institution.id,
+            InstitutionCourseEnrollment.student_id == student.id,
+        )
+        .order_by(InstitutionCourseEnrollment.assigned_at.desc())
+    ).all()
+    roadmap = db.scalar(select(Roadmap).where(Roadmap.student_id == student.id))
+    learning_plans = db.scalars(
+        select(LearningPlan).where(LearningPlan.student_id == student.id).order_by(LearningPlan.created_at.desc())
+    ).all()
+    projects = db.scalars(select(ProjectApplication).where(ProjectApplication.student_id == student.id)).all()
+    submissions = db.scalars(
+        select(ProjectSubmission).join(ProjectApplication).where(ProjectApplication.student_id == student.id)
+    ).all()
+    job_applications = db.execute(
+        select(JobApplication, JobVacancy)
+        .join(JobVacancy, JobVacancy.id == JobApplication.vacancy_id)
+        .where(JobApplication.student_id == student.id)
+        .order_by(JobApplication.applied_at.desc())
+    ).all()
+    mentorship_history = db.scalars(
+        select(InstitutionMentorshipHistory)
+        .where(
+            InstitutionMentorshipHistory.institution_id == institution.id,
+            InstitutionMentorshipHistory.student_id == student.id,
+        )
+        .order_by(InstitutionMentorshipHistory.created_at.desc(), InstitutionMentorshipHistory.id.desc())
+    ).all()
+    return ok({
+        **summary,
+        "mentors": [
+            {"id": membership.mentor.id, "name": membership.mentor.user.name, "expertise": membership.mentor.expertise}
+            for membership in institution_mentor_memberships(db, institution, active_only=True)
+        ],
+        "course_records": [{
+            "id": item.id,
+            "course_id": item.course_id,
+            "course_name": item.course.title,
+            "status": item.status,
+            "assigned_at": item.assigned_at.isoformat(),
+            "completed_at": item.completed_at.isoformat() if item.completed_at else None,
+            "score": item.score,
+        } for item in enrollments],
+        "roadmap": [{
+            "title": task.title,
+            "status": "COMPLETED" if task.completed else "PENDING",
+            "skill": task.skill.name if task.skill else None,
+        } for task in (roadmap.tasks if roadmap else [])] + [{
+            "title": task.title,
+            "status": task.status.upper().replace(" ", "_"),
+            "skill": task.skill.name if task.skill else None,
+        } for plan in learning_plans for task in plan.tasks],
+        "industry_projects": [{
+            "title": item.project.title,
+            "status": item.status,
+            "created_at": item.applied_at.isoformat() if item.applied_at else None,
+        } for item in projects],
+        "project_submissions": [{
+            "project": item.application.project.title,
+            "status": "EVALUATED" if item.evaluation else "SUBMITTED",
+            "submitted_at": item.submitted_at.isoformat() if item.submitted_at else None,
+            "feedback": item.evaluation.feedback if item.evaluation else "",
+            "score": item.evaluation.overall_score if item.evaluation else None,
+        } for item in submissions],
+        "job_applications": [{
+            "job": vacancy.title,
+            "company": db.get(Industry, vacancy.industry_id).company_name if db.get(Industry, vacancy.industry_id) else "Company unavailable",
+            "status": application.status,
+            "applied_at": application.applied_at.isoformat() if application.applied_at else None,
+        } for application, vacancy in job_applications],
+        "mentorship_history": [{
+            "status": item.status,
+            "mentor": item.mentor.user.name if item.mentor else None,
+            "reason": item.reason,
+            "notes": item.notes,
+            "follow_up_date": item.follow_up_date.isoformat() if item.follow_up_date else None,
+            "created_at": item.created_at.isoformat(),
+        } for item in mentorship_history],
+    })
+
+
+@app.post("/api/institution/students/{student_id}/courses", status_code=status.HTTP_201_CREATED)
+def institution_assign_course(student_id: int, payload: InstitutionCourseEnrollmentInput, user: Annotated[User, Depends(require_role("institution"))], db: Annotated[Session, Depends(get_db)]):
+    institution = institution_for(db, user)
+    student = db.get(Student, student_id)
+    if student is None or student not in institution_students(db, institution):
+        fail("Student not found in this institution", status.HTTP_404_NOT_FOUND)
+    if db.get(Course, payload.course_id) is None:
+        fail("Course not found", status.HTTP_404_NOT_FOUND)
+    enrollment = db.scalar(select(InstitutionCourseEnrollment).where(
+        InstitutionCourseEnrollment.institution_id == institution.id,
+        InstitutionCourseEnrollment.student_id == student.id,
+        InstitutionCourseEnrollment.course_id == payload.course_id,
+    ))
+    if enrollment is not None:
+        fail("Course is already assigned to this student", status.HTTP_409_CONFLICT)
+    enrollment = InstitutionCourseEnrollment(
+        institution_id=institution.id, student_id=student.id, course_id=payload.course_id
+    )
+    db.add(enrollment)
+    db.commit()
+    return ok({"id": enrollment.id, "course_id": enrollment.course_id, "status": enrollment.status})
+
+
+@app.patch("/api/institution/course-enrollments/{enrollment_id}")
+def institution_update_course_status(enrollment_id: int, payload: InstitutionCourseStatusInput, user: Annotated[User, Depends(require_role("institution"))], db: Annotated[Session, Depends(get_db)]):
+    institution = institution_for(db, user)
+    enrollment = db.scalar(select(InstitutionCourseEnrollment).where(
+        InstitutionCourseEnrollment.id == enrollment_id,
+        InstitutionCourseEnrollment.institution_id == institution.id,
+    ))
+    if enrollment is None or enrollment.student not in institution_students(db, institution):
+        fail("Course enrollment not found in this institution", status.HTTP_404_NOT_FOUND)
+    enrollment.status = payload.status
+    enrollment.score = payload.score
+    enrollment.completed_at = utc_now() if payload.status == "COMPLETED" else None
+    db.commit()
+    return ok({"id": enrollment.id, "status": enrollment.status, "completed_at": enrollment.completed_at.isoformat() if enrollment.completed_at else None})
+
+
+@app.get("/api/institution/mentors")
+def institution_mentors(user: Annotated[User, Depends(require_role("institution"))], db: Annotated[Session, Depends(get_db)]):
+    institution = institution_for(db, user)
+    memberships = institution_mentor_memberships(db, institution)
+    students = institution_students(db, institution)
+    mentorships = db.scalars(select(InstitutionMentorship).where(
+        InstitutionMentorship.institution_id == institution.id,
+    )).all()
+    mentorship_by_student = {item.student_id: item for item in mentorships}
+    active_mentor_ids = {
+        membership.mentor_id
+        for membership in institution_mentor_memberships(db, institution, active_only=True)
+    }
+    assigned = {
+        item.student_id: item for item in mentorships
+        if item.status in {"ASSIGNED", "IN_PROGRESS"} and item.mentor_id in active_mentor_ids
+    }
+    return ok({
+        "mentors": [institution_mentor_payload(db, institution, item) for item in memberships],
+        "students": [{
+            "id": student.id,
+            "name": student.user.name,
+            "career_goal": student.career_goal,
+            "department": student.department,
+            "skill_gaps": [
+                gap["skill"] for gap in institution_student_summary(db, institution, student)["skill_gaps"]
+                if gap["status"] == "NEEDS_IMPROVEMENT"
+            ],
+            "assigned_mentor_id": assigned[student.id].mentor_id if student.id in assigned else None,
+            "mentorship_status": (
+                mentorship_by_student[student.id].status
+                if student.id in assigned or (
+                    student.id in mentorship_by_student
+                    and mentorship_by_student[student.id].status not in {"ASSIGNED", "IN_PROGRESS"}
+                )
+                else "NOT_ASSIGNED"
+            ),
+            "mentorship_reason": mentorship_by_student[student.id].reason if student.id in mentorship_by_student else "",
+            "mentorship_notes": mentorship_by_student[student.id].notes if student.id in mentorship_by_student else "",
+            "follow_up_date": mentorship_by_student[student.id].follow_up_date.isoformat() if student.id in mentorship_by_student and mentorship_by_student[student.id].follow_up_date else None,
+        } for student in students],
+        "summary": {
+            "total_mentors": len(memberships),
+            "active_mentors": sum(item.active for item in memberships),
+            "assigned_students": len(assigned),
+            "students_without_mentor": sum(student.id not in assigned for student in students),
+        },
+    })
+
+
+@app.post("/api/institution/mentors", status_code=status.HTTP_201_CREATED)
+def institution_create_mentor(payload: InstitutionMentorInput, user: Annotated[User, Depends(require_role("institution"))], db: Annotated[Session, Depends(get_db)]):
+    institution = institution_for(db, user)
+    email = str(payload.email).strip().lower()
+    if db.scalar(select(User).where(func.lower(User.email) == email)) is not None:
+        fail("An account with this email already exists. Associate an existing mentor account instead.", status.HTTP_409_CONFLICT)
+    try:
+        mentor_user = User(
+            name=payload.name.strip(), email=email,
+            password_hash=hash_password(payload.password), role="mentor",
+        )
+        db.add(mentor_user)
+        db.flush()
+        mentor = Mentor(user_id=mentor_user.id, expertise=payload.expertise.strip(), experience=payload.experience)
+        db.add(mentor)
+        db.flush()
+        membership = InstitutionMentorMembership(
+            institution_id=institution.id, mentor_id=mentor.id,
+            expertise=mentor.expertise, experience=mentor.experience,
+            availability=payload.availability,
+        )
+        db.add(membership)
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        fail("Unable to create mentor account; an account with this email may already exist.", status.HTTP_409_CONFLICT)
+    return ok(institution_mentor_payload(db, institution, membership))
+
+
+@app.post("/api/institution/mentors/associate", status_code=status.HTTP_201_CREATED)
+def institution_associate_mentor(payload: InstitutionMentorAssociationInput, user: Annotated[User, Depends(require_role("institution"))], db: Annotated[Session, Depends(get_db)]):
+    institution = institution_for(db, user)
+    mentor_user = db.scalar(select(User).where(func.lower(User.email) == str(payload.email).strip().lower()))
+    mentor = db.scalar(select(Mentor).where(Mentor.user_id == mentor_user.id)) if mentor_user else None
+    if mentor is None:
+        fail("No existing mentor account was found for this email", status.HTTP_404_NOT_FOUND)
+    if institution_mentor_membership_for(db, institution, mentor.id, active_only=False) is not None:
+        fail("This mentor is already associated with your institution", status.HTTP_409_CONFLICT)
+    membership = InstitutionMentorMembership(
+        institution_id=institution.id, mentor_id=mentor.id,
+        expertise=mentor.expertise, experience=mentor.experience,
+    )
+    db.add(membership)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        fail("This mentor is already associated with your institution", status.HTTP_409_CONFLICT)
+    return ok(institution_mentor_payload(db, institution, membership))
+
+
+@app.put("/api/institution/mentors/{mentor_id}")
+def institution_update_mentor(mentor_id: int, payload: InstitutionMentorUpdateInput, user: Annotated[User, Depends(require_role("institution"))], db: Annotated[Session, Depends(get_db)]):
+    institution = institution_for(db, user)
+    membership = institution_mentor_membership_for(db, institution, mentor_id, active_only=False)
+    if membership is None:
+        fail("Mentor not found in this institution", status.HTTP_404_NOT_FOUND)
+    membership.expertise = payload.expertise.strip()
+    membership.experience = payload.experience
+    membership.availability = payload.availability
+    membership.active = payload.active
+    if not payload.active:
+        assignments = db.scalars(select(InstitutionMentorship).where(
+            InstitutionMentorship.institution_id == institution.id,
+            InstitutionMentorship.mentor_id == mentor_id,
+            InstitutionMentorship.status.in_(("ASSIGNED", "IN_PROGRESS")),
+        )).all()
+        for assignment in assignments:
+            assignment.mentor_id = None
+            assignment.status = "NOT_ASSIGNED"
+            assignment.reason = assignment.reason or "Mentor deactivated; reassignment required."
+            db.add(InstitutionMentorshipHistory(
+                institution_id=institution.id, student_id=assignment.student_id,
+                mentor_id=None, status=assignment.status, reason=assignment.reason,
+                notes=assignment.notes, follow_up_date=assignment.follow_up_date,
+            ))
+    db.commit()
+    return ok(institution_mentor_payload(db, institution, membership))
+
+
+@app.put("/api/institution/students/{student_id}/mentorship")
+def institution_update_mentorship(student_id: int, payload: InstitutionMentorshipInput, user: Annotated[User, Depends(require_role("institution"))], db: Annotated[Session, Depends(get_db)]):
+    institution = institution_for(db, user)
+    student = db.get(Student, student_id)
+    if student is None or student not in institution_students(db, institution):
+        fail("Student not found in this institution", status.HTTP_404_NOT_FOUND)
+    if payload.mentor_id is not None and institution_mentor_membership_for(db, institution, payload.mentor_id) is None:
+        fail("Mentor is not actively associated with this institution", status.HTTP_404_NOT_FOUND)
+    if payload.mentor_id is None and payload.status != "NOT_ASSIGNED":
+        fail("A mentor must be selected for an assigned mentorship status", status.HTTP_422_UNPROCESSABLE_ENTITY)
+    mentorship = db.scalar(select(InstitutionMentorship).where(
+        InstitutionMentorship.institution_id == institution.id,
+        InstitutionMentorship.student_id == student.id,
+    ))
+    if mentorship is None:
+        mentorship = InstitutionMentorship(institution_id=institution.id, student_id=student.id)
+        db.add(mentorship)
+    mentorship.mentor_id = payload.mentor_id
+    mentorship.status = payload.status
+    mentorship.reason = payload.reason
+    mentorship.notes = payload.notes
+    mentorship.follow_up_date = payload.follow_up_date
+    db.add(InstitutionMentorshipHistory(
+        institution_id=institution.id,
+        student_id=student.id,
+        mentor_id=mentorship.mentor_id,
+        status=mentorship.status,
+        reason=mentorship.reason,
+        notes=mentorship.notes,
+        follow_up_date=mentorship.follow_up_date,
+    ))
+    db.commit()
+    return ok({
+        "student_id": student.id,
+        "status": mentorship.status,
+        "mentor_name": mentorship.mentor.user.name if mentorship.mentor else None,
+        "follow_up_date": mentorship.follow_up_date.isoformat() if mentorship.follow_up_date else None,
+    })
 
 
 @app.get("/api/mentor/dashboard")
 def mentor_dashboard(user: Annotated[User, Depends(require_role("mentor"))], db: Annotated[Session, Depends(get_db)]):
-    submissions = db.scalars(select(ProjectSubmission)).all()
+    mentor = db.scalar(select(Mentor).where(Mentor.user_id == user.id))
+    student_ids = mentor_accessible_student_ids(db, mentor) if mentor else set()
+    submissions = db.scalars(
+        select(ProjectSubmission)
+        .join(ProjectApplication)
+        .where(ProjectApplication.student_id.in_(student_ids))
+    ).all() if student_ids else []
     return ok({"pending_evaluations": sum(item.evaluation is None for item in submissions), "evaluated": sum(item.evaluation is not None for item in submissions), "submissions": [{"id": item.id, "project": item.application.project.title, "student": item.application.student.user.name, "evaluated": item.evaluation is not None} for item in submissions]})
 
 
 from .industry_features import router as industry_features_router
 
 app.include_router(industry_features_router)
+from .industry_portal import router as industry_portal_router
+
+app.include_router(industry_portal_router)

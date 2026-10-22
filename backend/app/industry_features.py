@@ -89,6 +89,18 @@ class VacancyInput(BaseModel):
         return value
 
 
+class JobApplicationConsentInput(BaseModel):
+    profile_types: list[Literal["linkedin", "github", "leetcode"]] = Field(default_factory=list, max_length=3)
+    consent_decision: Literal["GRANTED", "DECLINED"]
+
+    @field_validator("consent_decision")
+    @classmethod
+    def validate_consent_choice(cls, value, info):
+        if value == "GRANTED" and not info.data.get("profile_types"):
+            raise ValueError("Select at least one profile type to grant access")
+        return value
+
+
 class IndustryProjectInput(BaseModel):
     title: str = Field(min_length=3, max_length=180)
     description: str = Field(min_length=10, max_length=12000)
@@ -227,6 +239,37 @@ def _project_payload(db: Session, project, student=None) -> dict:
     payload["eligibility"] = eligibility
     payload["required_skill_levels"] = requirements
     payload["candidate_match"] = _student_match(db, student, requirements) if student else None
+    from .industry_portal import IndustryProjectDetails
+
+    details = db.get(IndustryProjectDetails, project.id)
+    if details:
+        payload.update({
+            "category": details.category,
+            "deliverables": json.loads(details.deliverables or "[]"),
+            "instructions": details.instructions,
+            "duration_weeks": details.duration_weeks,
+            "participation": details.participation,
+            "team_size_min": details.team_size_min,
+            "team_size_max": details.team_size_max,
+            "references": json.loads(details.references or "[]"),
+            "publication_status": "PUBLISHED" if project.status == "OPEN" else project.status,
+        })
+    if student:
+        application = db.scalar(
+            select(main.ProjectApplication).where(
+                main.ProjectApplication.project_id == project.id,
+                main.ProjectApplication.student_id == student.id,
+            )
+        )
+        if application and application.submission:
+            from .industry_portal import IndustrySubmissionReview
+
+            latest_review = db.scalar(
+                select(IndustrySubmissionReview)
+                .where(IndustrySubmissionReview.submission_id == application.submission.id)
+                .order_by(IndustrySubmissionReview.reviewed_at.desc(), IndustrySubmissionReview.id.desc())
+            )
+            payload["submission_status"] = latest_review.decision if latest_review else "SUBMITTED"
     return payload
 
 
@@ -245,10 +288,14 @@ def _vacancy_payload(db: Session, vacancy, student=None) -> dict:
             )
         )
     industry = db.get(main.Industry, vacancy.industry_id)
+    from .industry_portal import IndustryDemoCompany, IndustryDemoVacancy, IndustryVacancyDetails
+    demo_vacancy = db.get(IndustryDemoVacancy, vacancy.id)
+    demo_company = db.scalar(select(IndustryDemoCompany).where(IndustryDemoCompany.industry_id == vacancy.industry_id))
+    vacancy_details = db.get(IndustryVacancyDetails, vacancy.id)
     application_count = db.scalar(
         select(func.count(JobApplication.id)).where(JobApplication.vacancy_id == vacancy.id)
     )
-    return {
+    payload = {
         "id": vacancy.id,
         "title": vacancy.title,
         "description": vacancy.description,
@@ -259,11 +306,18 @@ def _vacancy_payload(db: Session, vacancy, student=None) -> dict:
         "deadline": vacancy.deadline,
         "status": vacancy.status,
         "company": industry.company_name if industry else "",
+        "company_category": demo_company.category if demo_company else (industry.industry_type if industry else ""),
+        "is_demo": demo_vacancy is not None or demo_company is not None,
+        "demo_label": demo_vacancy.demo_label if demo_vacancy else ("DEMO COMPANY ACCOUNT" if demo_company else ""),
+        "preferred_skills": json.loads(vacancy_details.preferred_skills or "[]") if vacancy_details else [],
+        "experience_level": vacancy_details.experience_level if vacancy_details else "",
+        "posted_at": vacancy.created_at.isoformat() if vacancy.created_at else None,
         "application_count": application_count or 0,
         "application_status": application.status if application else None,
         "company_note": application.note if application else "",
         "candidate_match": _student_match(db, student, requirements) if student else None,
     }
+    return payload
 
 
 def _owned_project(db: Session, user, project_id: int):
@@ -292,6 +346,20 @@ def _owned_vacancy(db: Session, user, vacancy_id: int):
     if vacancy is None:
         main.fail("Job vacancy not found", 404)
     return vacancy
+
+
+def _validate_job_status_transition(current_status: str, next_status: str):
+    allowed = {
+        "APPLIED": {"REVIEWING", "SHORTLISTED", "INTERVIEW", "SELECTED", "NOT_SELECTED"},
+        "REVIEWING": {"SHORTLISTED", "INTERVIEW", "SELECTED", "NOT_SELECTED"},
+        "SHORTLISTED": {"REVIEWING", "INTERVIEW", "SELECTED", "NOT_SELECTED"},
+        "INTERVIEW": {"REVIEWING", "SHORTLISTED", "SELECTED", "NOT_SELECTED"},
+        "SELECTED": {"INTERVIEW", "NOT_SELECTED"},
+        "NOT_SELECTED": {"REVIEWING"},
+        "WITHDRAWN": set(),
+    }
+    if next_status != current_status and next_status not in allowed.get(current_status, set()):
+        _main().fail(f"Application status cannot transition from {current_status} to {next_status}", 409)
 
 
 @router.get("/api/student/project-marketplace")
@@ -593,6 +661,7 @@ def apply_job_vacancy(
     vacancy_id: int,
     user: Annotated[object, Depends(_main().require_role("student"))],
     db: Annotated[Session, Depends(get_db)],
+    payload: JobApplicationConsentInput | None = None,
 ):
     main = _main()
     student = main.student_for(db, user)
@@ -611,6 +680,20 @@ def apply_job_vacancy(
         main.fail("You have already applied to this vacancy", 409)
     application = JobApplication(vacancy_id=vacancy.id, student_id=student.id)
     db.add(application)
+    db.flush()
+    if payload is not None:
+        from .industry_portal import JobApplicationProfileConsent
+
+        decision = payload.consent_decision
+        granted_types = payload.profile_types if decision == "GRANTED" else []
+        db.add(JobApplicationProfileConsent(
+            student_id=student.id,
+            industry_id=vacancy.industry_id,
+            job_application_id=application.id,
+            requested_profile_types=json.dumps(granted_types),
+            granted_profile_types=json.dumps(granted_types),
+            status="GRANTED" if granted_types else "DENIED",
+        ))
     db.commit()
     return main.ok({"application_id": application.id, "status": application.status})
 
@@ -623,6 +706,8 @@ def vacancy_applications(
 ):
     main = _main()
     vacancy = _owned_vacancy(db, user, vacancy_id)
+    from .industry_portal import JobApplicationProfileConsent, _profile_consent_payload
+
     requirements = json.loads(vacancy.required_skill_levels or "{}")
     applications = db.scalars(
         select(JobApplication).where(JobApplication.vacancy_id == vacancy.id).order_by(JobApplication.applied_at.desc())
@@ -639,6 +724,11 @@ def vacancy_applications(
             "status": application.status,
             "note": application.note,
             "candidate_match": _student_match(db, application.student, requirements),
+            **_profile_consent_payload(db.scalar(
+                select(JobApplicationProfileConsent).where(
+                    JobApplicationProfileConsent.job_application_id == application.id
+                )
+            )),
         }
         for application in applications
     ])
@@ -663,9 +753,28 @@ def update_job_application(
     )
     if application is None:
         main.fail("Job application not found", 404)
+    _validate_job_status_transition(application.status, payload.status)
+    previous_status = application.status
     application.status = payload.status
     application.note = payload.note.strip()
     application.updated_at = _utc_now()
+    from .industry_portal import IndustryApplicationStatusHistory, _notify
+
+    db.add(IndustryApplicationStatusHistory(
+        job_application_id=application.id,
+        recruiter_user_id=user.id,
+        previous_status=previous_status,
+        status=payload.status,
+        note=payload.note.strip(),
+    ))
+    vacancy = db.get(JobVacancy, application.vacancy_id)
+    _notify(
+        db,
+        application.student.user_id,
+        "Application status updated",
+        f"Your application for {vacancy.title} is now {payload.status.lower().replace('_', ' ')}.",
+        "JOB_APPLICATION",
+    )
     db.commit()
     return main.ok({"application_id": application.id, "status": application.status, "note": application.note})
 
